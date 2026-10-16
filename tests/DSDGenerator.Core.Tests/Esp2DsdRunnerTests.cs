@@ -13,6 +13,7 @@ namespace DSDGenerator.Core.Tests;
 public class Esp2DsdRunnerTests : IDisposable
 {
     private readonly string _tempDir;
+    private readonly string _exeDir;
     private readonly string _fakeExePath;
     private readonly string _originalPluginPath;
     private readonly string _translatedPluginPath;
@@ -25,10 +26,14 @@ public class Esp2DsdRunnerTests : IDisposable
             Path.GetTempPath(), "dsdgen-runner-" + Guid.NewGuid());
         Directory.CreateDirectory(_tempDir);
 
-        // Путь к fake exe — в нашей temp-папке, а не в
-        // AppContext.BaseDirectory/Assets/. Это делает тесты
-        // полностью независимыми от глобального состояния.
-        _fakeExePath = Path.Combine(_tempDir, "esp2dsd.exe");
+        // Exe живёт в ОТДЕЛЬНОЙ подпапке — это моделирует реальный
+        // Assets/, где exe лежит с _internal/ и string_records.json.
+        // Наша тестовая подпапка не содержит ничего лишнего,
+        // поэтому CopyDirectoryRecursive копирует только exe.
+        _exeDir = Path.Combine(_tempDir, "exe");
+        Directory.CreateDirectory(_exeDir);
+
+        _fakeExePath = Path.Combine(_exeDir, "esp2dsd.exe");
         File.WriteAllText(_fakeExePath, "fake esp2dsd.exe for tests");
 
         _originalPluginPath = Path.Combine(_tempDir, "SkyUI_SE.esp");
@@ -129,7 +134,6 @@ public class Esp2DsdRunnerTests : IDisposable
     [Fact]
     public async Task ExeMissing_Throws()
     {
-        // Удаляем fake exe — этот тест проверяет отсутствие.
         File.Delete(_fakeExePath);
 
         var pair = MakePair(_originalPluginPath, _translatedPluginPath);
@@ -196,7 +200,17 @@ public class Esp2DsdRunnerTests : IDisposable
 
         result.Should().Be("[{\"test\":\"data\"}]");
         _processRunner.CallCount.Should().Be(1);
-        _processRunner.LastFileName.Should().Be(_fakeExePath);
+
+        // Exe запускается из temp, а не из исходного Assets/.
+        _processRunner.LastFileName.Should().NotBeNull();
+        Path.GetFileName(_processRunner.LastFileName!)
+            .Should().Be("esp2dsd.exe");
+        _processRunner.LastFileName!.Should().NotBe(_fakeExePath);
+
+        // CWD процесса = та же temp-папка, где exe.
+        _processRunner.LastWorkingDirectory.Should().Be(
+            Path.GetDirectoryName(_processRunner.LastFileName!));
+
         _processRunner.LastArguments.Should().HaveCount(2);
         _processRunner.LastArguments![0].Should().Be(_originalPluginPath);
         _processRunner.LastArguments[1].Should().Be(_translatedPluginPath);
@@ -218,6 +232,53 @@ public class Esp2DsdRunnerTests : IDisposable
         var pair = MakePair(_originalPluginPath, _translatedPluginPath);
         await _runner.GenerateAsync(pair, CancellationToken.None);
 
+        observedTempDir.Should().NotBeNull();
+        Directory.Exists(observedTempDir!).Should().BeFalse();
+    }
+
+    [Fact]
+    public async Task Success_ExeDirectoryFilesCopiedToTemp()
+    {
+        // Создаём рядом с exe "соседа" — как в реальном Assets/,
+        // где лежит string_records.json и подпапка _internal/.
+        var siblingDir = Path.Combine(_exeDir, "_internal");
+        Directory.CreateDirectory(siblingDir);
+        File.WriteAllText(
+            Path.Combine(siblingDir, "python311.dll"), "fake python");
+        File.WriteAllText(
+            Path.Combine(_exeDir, "string_records.json"), "{}");
+
+        string? observedTempDir = null;
+        _processRunner.OnRun = (_, _, wd) =>
+        {
+            observedTempDir = wd;
+
+            // Внутри temp должны быть exe и его соседи.
+            File.Exists(Path.Combine(wd, "esp2dsd.exe"))
+                .Should().BeTrue();
+            File.Exists(Path.Combine(wd, "string_records.json"))
+                .Should().BeTrue();
+            File.Exists(Path.Combine(wd, "_internal", "python311.dll"))
+                .Should().BeTrue();
+
+            var outputDir = Path.Combine(wd, "Output");
+            Directory.CreateDirectory(outputDir);
+            File.WriteAllText(
+                Path.Combine(outputDir, "SkyUI_SE_output.esp.json"),
+                "[{\"test\":\"data\"}]");
+
+            return new ProcessRunResult
+            {
+                ExitCode = 0,
+                StandardOutput = "",
+                StandardError = "",
+            };
+        };
+
+        var pair = MakePair(_originalPluginPath, _translatedPluginPath);
+        await _runner.GenerateAsync(pair, CancellationToken.None);
+
+        // Temp удалена — вместе с скопированными файлами.
         observedTempDir.Should().NotBeNull();
         Directory.Exists(observedTempDir!).Should().BeFalse();
     }

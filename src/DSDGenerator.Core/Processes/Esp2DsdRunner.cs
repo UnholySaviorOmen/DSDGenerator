@@ -11,13 +11,24 @@ namespace DSDGenerator.Core.Processes;
 /// <summary>
 /// Реализация IDsGenerator поверх внешнего esp2dsd.exe.
 ///
-/// esp2dsd.exe:
+/// esp2dsd.exe — сборка PyInstaller (onedir). Рядом с exe лежат:
+///   - string_records.json — читается относительно CWD (см. converter.py);
+///   - _internal/ — Python runtime и .pyd/.dll.
+///
+/// esp2dsd:
 ///   - принимает на вход два пути (оригинал + перевод);
 ///   - пишет JSON-массив в CWD/Output/&lt;stem&gt;_output&lt;suffix&gt;.json;
 ///   - возвращает exit code 0 при успехе.
 ///
-/// Мы запускаем его в уникальной temp-папке, читаем выходной файл
-/// и валидируем, что это непустой JSON-массив.
+/// Мы не запускаем exe напрямую из Assets/: CWD процесса должен
+/// указывать на папку, где лежит string_records.json, а вывод —
+/// в отдельный временный Output/. Поэтому:
+///   1. Создаём уникальную temp-папку.
+///   2. Копируем в неё ВСЁ содержимое папки exe (exe + string_records.json
+///      + _internal/).
+///   3. Запускаем temp/esp2dsd.exe с CWD = temp.
+///   4. Читаем temp/Output/&lt;file&gt;.json.
+///   5. Удаляем temp целиком.
 ///
 /// Валидация содержимого JSON не делается — только структура
 /// верхнего уровня. За корректность самого содержимого
@@ -25,8 +36,6 @@ namespace DSDGenerator.Core.Processes;
 ///
 /// Путь к exe передаётся через конструктор: продакшн использует
 /// DsdPaths.Esp2DsdExePath, тесты — путь в своей temp-папке.
-/// Это позволяет тестам полностью контролировать наличие exe
-/// без глобальных мутаций AppContext.BaseDirectory.
 /// </summary>
 public sealed class Esp2DsdRunner : IDsGenerator
 {
@@ -94,14 +103,28 @@ public sealed class Esp2DsdRunner : IDsGenerator
 
         Directory.CreateDirectory(tempDir);
 
-        _logger.LogDebug(
-            "Running esp2dsd for '{Plugin}' (temp: {Temp})",
-            pair.PluginFileName, tempDir);
-
         try
         {
+            // Копируем ВСЮ папку с esp2dsd.exe (PyInstaller onedir:
+            // exe + _internal/ + string_records.json) в temp.
+            // Причина: esp2dsd читает string_records.json относительно
+            // CWD, а CWD у нас = temp. Плюс exe ищет _internal/ рядом
+            // с собой — значит, exe тоже должен быть в temp.
+            var exeDir = Path.GetDirectoryName(_exePath)
+                ?? throw new InvalidOperationException(
+                    $"Cannot determine directory of esp2dsd.exe: {_exePath}");
+
+            CopyDirectoryRecursive(exeDir, tempDir);
+
+            var tempExePath = Path.Combine(
+                tempDir, Path.GetFileName(_exePath));
+
+            _logger.LogDebug(
+                "Running esp2dsd for '{Plugin}' (temp: {Temp})",
+                pair.PluginFileName, tempDir);
+
             var run = await _processRunner.RunAsync(
-                fileName: _exePath,
+                fileName: tempExePath,
                 arguments: new[]
                 {
                     pair.Original.FullPath,
@@ -224,6 +247,39 @@ public sealed class Esp2DsdRunner : IDsGenerator
         {
             _logger.LogWarning(ex,
                 "Failed to delete temp directory: {Path}", path);
+        }
+    }
+
+    /// <summary>
+    /// Рекурсивно копирует всё содержимое sourceDir в destDir.
+    /// destDir должна существовать (создаётся вызывающим).
+    /// Файлы копируются с overwrite: false — temp пустой, коллизий
+    /// быть не должно.
+    /// </summary>
+    private static void CopyDirectoryRecursive(
+        string sourceDir, string destDir)
+    {
+        foreach (var dir in Directory.EnumerateDirectories(
+            sourceDir, "*", SearchOption.AllDirectories))
+        {
+            var relative = Path.GetRelativePath(sourceDir, dir);
+            Directory.CreateDirectory(Path.Combine(destDir, relative));
+        }
+
+        foreach (var file in Directory.EnumerateFiles(
+            sourceDir, "*", SearchOption.AllDirectories))
+        {
+            var relative = Path.GetRelativePath(sourceDir, file);
+            var dest = Path.Combine(destDir, relative);
+
+            var destParent = Path.GetDirectoryName(dest);
+            if (!string.IsNullOrEmpty(destParent)
+                && !Directory.Exists(destParent))
+            {
+                Directory.CreateDirectory(destParent);
+            }
+
+            File.Copy(file, dest, overwrite: false);
         }
     }
 }
